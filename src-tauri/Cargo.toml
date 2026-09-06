@@ -30,7 +30,7 @@ tokio = { version = "1.52.1", features = ["full"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 rusqlite_migration = "2.5.0"
 deadpool-sqlite = { package = "deadpool-sqlite", git = "https://github.com/deadpool-rs/deadpool.git", rev = "f4efd12e65b2cc9347f6ca0ee42800cd376ea658" }
-dirs = "6.0.0"
+dirs = "7.0.0"
 gray_matter = "0.3.2"
 ignore = "0.4.25"
 notify = "=8.2.0"
