@@ -1,6 +1,7 @@
 use rusqlite::{params, OptionalExtension};
 
 use crate::error::AppError;
+use crate::store::with_write_txn;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredProjectSnapshot {
@@ -63,7 +64,7 @@ pub fn upsert_project_snapshot(
     phase_plans: Vec<StoredPhasePlan>,
     now: i64,
 ) -> Result<(), AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
+    with_write_txn(connection, |transaction| {
     let project_id = snapshot.id.clone();
     let next_command = if snapshot.next_command.trim().is_empty() {
         "/gsd-next"
@@ -162,7 +163,8 @@ pub fn upsert_project_snapshot(
             .map_err(AppError::from)?;
     }
 
-    transaction.commit().map_err(AppError::from)
+    Ok(())
+    })
 }
 
 /// Loads a project snapshot by its root path.
@@ -265,19 +267,19 @@ pub fn list_project_snapshots(
 
 /// Deletes all project data from the cache.
 pub fn clear_project_cache(connection: &mut rusqlite::Connection) -> Result<(), AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
+    with_write_txn(connection, |transaction| {
+        transaction
+            .execute("DELETE FROM phase_plans", [])
+            .map_err(AppError::from)?;
+        transaction
+            .execute("DELETE FROM scan_log", [])
+            .map_err(AppError::from)?;
+        transaction
+            .execute("DELETE FROM projects", [])
+            .map_err(AppError::from)?;
 
-    transaction
-        .execute("DELETE FROM phase_plans", [])
-        .map_err(AppError::from)?;
-    transaction
-        .execute("DELETE FROM scan_log", [])
-        .map_err(AppError::from)?;
-    transaction
-        .execute("DELETE FROM projects", [])
-        .map_err(AppError::from)?;
-
-    transaction.commit().map_err(AppError::from)
+        Ok(())
+    })
 }
 
 /// Loads all phase plans for a project.
@@ -314,18 +316,18 @@ pub fn replace_plan_items(
     plan_path: &str,
     items: Vec<StoredPlanItem>,
 ) -> Result<(), AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
-    transaction
-        .execute(
-            "DELETE FROM plan_items WHERE project_id = ?1 AND plan_path = ?2",
-            params![project_id, plan_path],
-        )
-        .map_err(AppError::from)?;
-
-    for item in items {
+    with_write_txn(connection, |transaction| {
         transaction
             .execute(
-                "INSERT INTO plan_items (
+                "DELETE FROM plan_items WHERE project_id = ?1 AND plan_path = ?2",
+                params![project_id, plan_path],
+            )
+            .map_err(AppError::from)?;
+
+        for item in items {
+            transaction
+                .execute(
+                    "INSERT INTO plan_items (
                     project_id,
                     plan_path,
                     ord,
@@ -334,19 +336,20 @@ pub fn replace_plan_items(
                     line_no
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    item.project_id,
-                    item.plan_path,
-                    item.ord,
-                    item.text,
-                    i64::from(item.checked),
-                    item.line_no,
-                ],
-            )
-            .map_err(AppError::from)?;
-    }
+                    params![
+                        item.project_id,
+                        item.plan_path,
+                        item.ord,
+                        item.text,
+                        i64::from(item.checked),
+                        item.line_no,
+                    ],
+                )
+                .map_err(AppError::from)?;
+        }
 
-    transaction.commit().map_err(AppError::from)
+        Ok(())
+    })
 }
 
 /// Loads plan items for a specific project and plan path.

@@ -2,6 +2,7 @@ use rusqlite::params;
 use std::collections::HashMap;
 
 use crate::error::AppError;
+use crate::store::with_write_txn;
 
 const MIN_DAYS: i64 = 1;
 const MAX_DAYS: i64 = 365;
@@ -21,9 +22,9 @@ pub fn rebuild_window(
     days: i64,
     now_ms: i64,
 ) -> Result<(), AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
-    rebuild_window_in_transaction(&transaction, days, now_ms)?;
-    transaction.commit().map_err(AppError::from)
+    with_write_txn(connection, |transaction| {
+        rebuild_window_in_transaction(transaction, days, now_ms)
+    })
 }
 
 /// Rebuilds daily activity within an existing transaction.

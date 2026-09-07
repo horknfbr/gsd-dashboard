@@ -75,3 +75,27 @@ fn configure_connection(connection: &mut Connection) -> rusqlite::Result<()> {
     connection.busy_timeout(Duration::from_secs(5))?;
     Ok(())
 }
+
+/// Runs `body` inside a single write transaction, owning begin/commit and
+/// error mapping. The body receives the active transaction; it must NOT
+/// commit. Any `Err` returned rolls back (transaction drop).
+pub fn with_write_txn<T>(
+    connection: &mut rusqlite::Connection,
+    body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let transaction = connection.transaction().map_err(AppError::from)?;
+    let value = body(&transaction)?;
+    transaction.commit().map_err(AppError::from)?;
+    Ok(value)
+}
+
+/// Executes a single DELETE (or other row-count) statement with no params and
+/// returns the affected row count. For standalone single-statement writes that
+/// intentionally run outside a transaction. `&Transaction` also accepts here
+/// via deref coercion if ever needed.
+pub fn execute_delete(connection: &rusqlite::Connection, sql: &str) -> Result<i64, AppError> {
+    connection
+        .execute(sql, [])
+        .map(|count| count as i64)
+        .map_err(AppError::from)
+}

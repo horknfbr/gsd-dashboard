@@ -53,11 +53,11 @@ pub async fn clear_session_index_for_app(
     let connection = state.pool.get().await.map_err(AppError::store)?;
     let summary = connection
         .interact(move |connection| {
-            let transaction = connection.transaction().map_err(AppError::from)?;
-            let summary = repo::clear_session_index_in_transaction(&transaction)?;
-            daily_activity::rebuild_window_in_transaction(&transaction, 90, now_ms)?;
-            transaction.commit().map_err(AppError::from)?;
-            Ok::<_, AppError>(summary)
+            crate::store::with_write_txn(connection, |transaction| {
+                let summary = repo::clear_session_index_in_transaction(transaction)?;
+                daily_activity::rebuild_window_in_transaction(transaction, 90, now_ms)?;
+                Ok(summary)
+            })
         })
         .await
         .map_err(AppError::store)??;

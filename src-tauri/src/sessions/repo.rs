@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::{
     error::AppError,
     sessions::{IndexedSession, ProjectRoot, SessionIndexState, SessionSource},
+    store::{execute_delete, with_write_txn},
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -203,20 +204,18 @@ pub fn persist_indexed_file_result(
     state: &SessionIndexState,
     now: i64,
 ) -> Result<(), AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
-
-    transaction
-        .execute(
-            "DELETE FROM sessions WHERE source_path = ?1",
-            [&state.source_path],
-        )
-        .map_err(AppError::from)?;
-    for session in sessions {
-        upsert_indexed_session(&transaction, session, now)?;
-    }
-    save_index_state(&transaction, state, now)?;
-
-    transaction.commit().map_err(AppError::from)
+    with_write_txn(connection, |transaction| {
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE source_path = ?1",
+                [&state.source_path],
+            )
+            .map_err(AppError::from)?;
+        for session in sessions {
+            upsert_indexed_session(transaction, session, now)?;
+        }
+        save_index_state(transaction, state, now)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -230,11 +229,9 @@ pub struct SessionIndexClearSummary {
 pub fn clear_session_index(
     connection: &mut rusqlite::Connection,
 ) -> Result<SessionIndexClearSummary, AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
-    let summary = clear_session_index_in_transaction(&transaction)?;
-    transaction.commit().map_err(AppError::from)?;
-
-    Ok(summary)
+    with_write_txn(connection, |transaction| {
+        clear_session_index_in_transaction(transaction)
+    })
 }
 
 /// Clears sessions and index states within a transaction.
@@ -256,35 +253,29 @@ pub fn clear_session_index_in_transaction(
 
 /// Deletes all sessions without a project attribution.
 pub fn prune_unmatched_sessions(connection: &mut rusqlite::Connection) -> Result<i64, AppError> {
-    connection
-        .execute("DELETE FROM sessions WHERE project_id IS NULL", [])
-        .map(|count| count as i64)
-        .map_err(AppError::from)
+    execute_delete(connection, "DELETE FROM sessions WHERE project_id IS NULL")
 }
 
 /// Removes index states with no corresponding sessions.
 pub fn prune_orphan_index_states(connection: &mut rusqlite::Connection) -> Result<i64, AppError> {
-    connection
-        .execute(
-            "DELETE FROM session_index_state
+    execute_delete(
+        connection,
+        "DELETE FROM session_index_state
              WHERE NOT EXISTS (
                 SELECT 1
                 FROM sessions
                 WHERE sessions.source_path = session_index_state.source_path
              )",
-            [],
-        )
-        .map(|count| count as i64)
-        .map_err(AppError::from)
+    )
 }
 
 /// Removes index states for Codex sessions lacking token data.
 pub fn prune_tokenless_codex_index_states(
     connection: &mut rusqlite::Connection,
 ) -> Result<i64, AppError> {
-    connection
-        .execute(
-            "DELETE FROM session_index_state
+    execute_delete(
+        connection,
+        "DELETE FROM session_index_state
              WHERE source = 'codex'
                 AND EXISTS (
                     SELECT 1
@@ -295,10 +286,7 @@ pub fn prune_tokenless_codex_index_states(
                         AND COALESCE(sessions.tokens_in, 0) = 0
                         AND COALESCE(sessions.tokens_out, 0) = 0
                 )",
-            [],
-        )
-        .map(|count| count as i64)
-        .map_err(AppError::from)
+    )
 }
 
 /// Deletes sessions and index states under a path prefix.
@@ -306,29 +294,29 @@ pub fn prune_indexed_paths_under(
     connection: &mut rusqlite::Connection,
     path_prefix: &str,
 ) -> Result<i64, AppError> {
-    let transaction = connection.transaction().map_err(AppError::from)?;
-    let path_prefix_with_separator = format!("{}/", path_prefix.trim_end_matches('/'));
-    let prefix_len: i64 = path_prefix_with_separator
-        .len()
-        .try_into()
-        .map_err(|_| AppError::store("session path prefix is too long"))?;
-    let pruned_sessions = transaction
-        .execute(
-            "DELETE FROM sessions
+    with_write_txn(connection, |transaction| {
+        let path_prefix_with_separator = format!("{}/", path_prefix.trim_end_matches('/'));
+        let prefix_len: i64 = path_prefix_with_separator
+            .len()
+            .try_into()
+            .map_err(|_| AppError::store("session path prefix is too long"))?;
+        let pruned_sessions = transaction
+            .execute(
+                "DELETE FROM sessions
              WHERE source_path = ?1 OR substr(source_path, 1, ?2) = ?3",
-            params![path_prefix, prefix_len, path_prefix_with_separator],
-        )
-        .map_err(AppError::from)?;
-    transaction
-        .execute(
-            "DELETE FROM session_index_state
+                params![path_prefix, prefix_len, path_prefix_with_separator],
+            )
+            .map_err(AppError::from)?;
+        transaction
+            .execute(
+                "DELETE FROM session_index_state
              WHERE source_path = ?1 OR substr(source_path, 1, ?2) = ?3",
-            params![path_prefix, prefix_len, path_prefix_with_separator],
-        )
-        .map_err(AppError::from)?;
+                params![path_prefix, prefix_len, path_prefix_with_separator],
+            )
+            .map_err(AppError::from)?;
 
-    transaction.commit().map_err(AppError::from)?;
-    Ok(pruned_sessions as i64)
+        Ok(pruned_sessions as i64)
+    })
 }
 
 /// Re-attributes unmatched sessions to known projects.
@@ -338,27 +326,27 @@ pub fn rematch_unmatched_sessions_against_projects(
     now: i64,
 ) -> Result<i64, AppError> {
     let unmatched_sessions = load_unmatched_sessions(connection)?;
-    let transaction = connection.transaction().map_err(AppError::from)?;
-    let mut rematched_count = 0;
+    with_write_txn(connection, |transaction| {
+        let mut rematched_count = 0;
 
-    for session in unmatched_sessions {
-        if let Some((project_id, method)) = match_project(&session, known_projects) {
-            transaction
-                .execute(
-                    "UPDATE sessions
+        for session in unmatched_sessions {
+            if let Some((project_id, method)) = match_project(&session, known_projects) {
+                transaction
+                    .execute(
+                        "UPDATE sessions
                      SET project_id = ?1,
                          attribution_method = ?2,
                          updated_at = ?3
                      WHERE id = ?4 AND project_id IS NULL",
-                    params![project_id, method, now, session.id],
-                )
-                .map_err(AppError::from)?;
-            rematched_count += 1;
+                        params![project_id, method, now, session.id],
+                    )
+                    .map_err(AppError::from)?;
+                rematched_count += 1;
+            }
         }
-    }
 
-    transaction.commit().map_err(AppError::from)?;
-    Ok(rematched_count)
+        Ok(rematched_count)
+    })
 }
 
 /// Loads today's session counts, tokens, and 7-day sparklines.
